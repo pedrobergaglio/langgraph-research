@@ -1,10 +1,14 @@
 {
   "dockerfile_lines": [],
   "graphs": {
+    "task_manager": "./task_manager.py:graph",
+    "toy_example": "./toy_example.py:graph",
+    "toy_example2": "./toy_example2.py:graph",
     "parallelization": "./parallelization.py:graph",
     "sub_graphs": "./sub_graphs.py:graph",
     "map_reduce": "./map_reduce.py:graph",
-    "research_assistant": "./research_assistant.py:graph"
+    "research_assistant": "./research_assistant.py:graph",
+    "research_assistant_bis": "./research_assistant_bis.py:graph"
   },
   "env": "./.env",
   "python_version": "3.11",
