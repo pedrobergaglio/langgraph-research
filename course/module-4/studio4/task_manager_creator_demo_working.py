@@ -22,16 +22,11 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 ### Schema
 
-class messageClass(BaseModel):
-    content:str
-
 class Action(BaseModel):
     id:int
     type:str # (gmail, bank, erp...)
     name:str
     confirmed:bool = True #if the action can be done
-    #params:Optional[dict] = None
-    #function:Optional[str] = None
 
 class ActionsDB(BaseModel):
     actions:List[Action]
@@ -51,7 +46,6 @@ class Procedure(BaseModel):
 
 class BestProcedure(BaseModel):
     id: int = Field("the index of the selected procedure in the list of procedures")
-    message:str
 
 class ToyStoredProceduresDB(BaseModel):
     procedures:List[Procedure]
@@ -66,16 +60,16 @@ class ToyStoredProceduresDB(BaseModel):
 class ExecutorState(MessagesState): 
     #we use messages to store the questions from the agent and answers from the user
     procedure:Procedure
-    done_actions:List[Action] = [] #to store the actions done by the executor
+    actions_done:List[Action] = [] #to store the actions done by the executor
 
-class GeneralState(MessagesState): #this is the general state with the general data needed.
+class GeneralState(TypedDict): #this is the general state with the general data needed.
     request:str
     stored_procedures:ToyStoredProceduresDB
     human_feedback_select_message:str
     human_feedback_confirm_message: Optional[Literal['yes', 'no']] = None
     procedure:Procedure
-    pending_actions:List[Action]
-    done_actions: List[Action]
+    actions_pending:List[Action]
+    actions_done: List[Action]
     actions_database:ActionsDB
 
 class CreatorState(MessagesState):
@@ -93,16 +87,20 @@ class CreateSelect(BaseModel):
 orchestrator_instructions="""You are tasked to select one of the stored procedures based on the user request. 
 Follow these instructions carefully:
 
-1. First, review the user request and feedback in the conversation.
+1. First, review the user request:
+{request}
         
 2. Examine each of the stored procedures that have been provided: 
         
 {stored_procedures}
+
+3. Consider the last user feedback if provided here:
+
+{human_feedback_select_message}
     
-3. Determine the most accurate procedure based upon information above.
+4. Determine the most accurate procedure based upon information above.
                     
-4. Return the ID of the selected one, starting 0 as the ID for the first procedure, 
-and a one sentence message to the user to continue the conversation and informing the selected procedure and why."""
+5. Return the ID of the selected one, starting 0 as the ID for the first procedure"""
 
 def select_procedure(state: GeneralState):
     
@@ -112,36 +110,26 @@ def select_procedure(state: GeneralState):
     request = state["request"]
     human_feedback_select_message = state.get('human_feedback_select_message', '') #this can be none
     stored_procedures = state["stored_procedures"]
-    messages = state.get('messages', [])
-
-    if request == "" or request == None:
-        message = human_feedback_select_message
-    else:
-        message = request
         
     # Enforce structured output to get the index of the procedure
     structured_llm = llm.with_structured_output(BestProcedure) 
     
     # parsing the System message
-    system_message = orchestrator_instructions.format(stored_procedures=stored_procedures)
+    system_message = orchestrator_instructions.format(request=request, stored_procedures=stored_procedures,
+                                                            human_feedback_select_message=human_feedback_select_message)
 
     # select procedure
-    procedure_id = structured_llm.invoke([SystemMessage(content=system_message)]+messages+[HumanMessage(content=message)])
+    procedure_id = structured_llm.invoke([SystemMessage(content=system_message)]+[HumanMessage(content="Select the correct procedure")])
 
     #raise NodeInterrupt({type(stored_procedures)})
 
     procedure = stored_procedures.procedures[procedure_id.id]
-
-    messages.append(HumanMessage(content=message))
-    messages.append(AIMessage(content=procedure_id.message))
     
     # Write the procedure to state
     return {"stored_procedures": stored_procedures,
             "procedure": procedure, 
-            "pending_actions": procedure.actions, 
+            "actions_pending": procedure.actions, 
             "human_feedback_select_message": "approve", #we return the selected procedure and reset the feedback
-            "request": '',
-            "messages": messages
             } 
 
 # un punto concreto donde se para, para poder recibir feedback después mediante otro metodo
@@ -185,60 +173,35 @@ def executor(state: GeneralState):
     """ Node to execute the procedure """
 
     # Get state
-    done_actions = state.get("done_actions", [])
-    human_feedback_confirm_message = state.get('human_feedback_confirm_message', '')
+    actions_done = state.get("actions_done", [])
+    human_feedback_confirm_message = state.get('human_feedback_confirm_message', 'no') #this can be none
     #next_action = None
-    actions = state.get("pending_actions", [])
-    messages = state.get('messages', [])
-    human_feedback_select_message = state.get('human_feedback_select_message', '')
-
-    if human_feedback_select_message.lower() == "approve":
-        messages.append(HumanMessage(content="I confirm the procedure"))
-        human_feedback_select_message = ""
+    actions = state.get("actions_pending", [])
 
     for action in actions:
 
         #next_action = action
         confirmed = action.confirmed
 
-        if human_feedback_confirm_message.lower() == 'yes':
-            messages.append(HumanMessage(content="I confirm the action"))
+        if human_feedback_confirm_message == 'yes' and not confirmed:
+            #human_feedback_confirm_message = 'no'
             confirmed = True
-        if human_feedback_confirm_message.lower() == 'no':
-            messages.append(HumanMessage(content="I don't confirm the action, end this conversation."))
-            actions = []
-            return {
-                    "messages": messages,
-                    "human_feedback_confirm_message": "",
-                    "human_feedback_select_message": "",
-                    "done_actions": done_actions, 
-                    "pending_actions": actions,
-                    }
-
         if confirmed:
-            done_actions.append(action)
+            actions_done.append(action)
             actions = actions[1:]
+            #raise NodeInterrupt(f"The task {action['name']} has been completed")
+            return {"actions_done": actions_done, 
+            "actions_pending": actions, 
+            "human_feedback_select_message": "approve", 
+            "human_feedback_confirm_message": "no"} #we return the actions done and the executor state
 
-            human_feedback_confirm_message = ""
         else:
+            raise NodeInterrupt(
+                f"The task {action.name} needs confirmation from the user")
 
-            messages.append(AIMessage(content=f"The action {action.name} needs your confirmation"))
-
-            return {
-                    "messages": messages,
-                    "human_feedback_confirm_message": "",
-                    "human_feedback_select_message": "",
-                    "done_actions": done_actions, 
-                    "pending_actions": actions,
-                    }
         
-    return {
-            "done_actions": done_actions, 
-            "pending_actions": actions, 
-            "human_feedback_confirm_message": "",
-            "messages": messages,
-            "human_feedback_select_message": ""
-            }
+
+        #next_action = None
 
 # prompt for the procedure creator
 creator_instructions="""You are tasked to create an ordered list of actions (called stored procedure) based on the user request, 
@@ -303,14 +266,9 @@ def start(state: GeneralState):
 
     actions_database = state.get('actions_database', {})
     stored_procedures = state.get('stored_procedures', {})
-    messages = state.get('messages', [])
 
     if actions_database != {} and stored_procedures != {}:
-        llm_str = llm.with_structured_output(messageClass)
-        
-        response = llm_str.invoke([SystemMessage(content="Send a one sentence message to the user to conclude the last conversation and tell that you are available to do another task")]+messages)
-        messages.append(AIMessage(content=response.content))
-        return {"messages": messages}
+        pass
 
     else: return {"stored_procedures": ToyStoredProceduresDB(procedures=[
         Procedure(
@@ -336,14 +294,6 @@ def start(state: GeneralState):
                 Action(id=7, name="calculate profits and costs", type="calculator", confirmed=True),
                 Action(id=8, name="generate sections", type="agents", confirmed=True),
                 Action(id=9, name="generate report", type="report generator", confirmed=True)
-            ]
-        ),
-        Procedure(
-            description="create new order in system",
-            actions=[
-                Action(id=10, name="send main order information to system", type="erp", confirmed=True),
-                Action(id=11, name="create option for the order", type="erp", confirmed=True),
-                Action(id=12, name="add products to the last order", type="erp", confirmed=True),
             ]
         )
     ]),
@@ -403,19 +353,17 @@ def decide_execute_end(state: GeneralState):
 
     """ Conditional edge to initiate executor or return to orchestrator """ 
 
-    pending_actions = state.get('pending_actions', [])
-    human_feedback_confirm_message=state.get('human_feedback_confirm_message','')
+    actions_penging = state.get('actions_pending', [])
 
     # Check if human feedback
-    if pending_actions == []:
+    #human_feedback_confirm_message=state.get('human_feedback_confirm_message','no')
+    if actions_penging == []:
 
         return "start" # if user cancels OR all tasks are done just finish the execution
-    elif human_feedback_confirm_message != '':
-        return "executor"
+
     ***REMOVED***wise 
     else:
-        raise NodeInterrupt("There are still actions pending")
-        #return "executor"
+        return "executor"
 
 def decide_create_done(state: CreatorState):
 
@@ -516,4 +464,4 @@ builder.add_edge("executor", "human_feedback_confirm")
 builder.add_conditional_edges("human_feedback_confirm", decide_execute_end, ["executor", "start"])
 
 # Compile
-graph = builder.compile(interrupt_before=['human_feedback_select', 'human_feedback_create'], interrupt_after=['start'])
+graph = builder.compile(interrupt_before=['human_feedback_select', 'start', 'human_feedback_create'])
