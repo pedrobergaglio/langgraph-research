@@ -1,6 +1,6 @@
 import operator #operator.add(x, y) is equivalent to the expression x+y
-from pydantic import BaseModel, Field # base for classes 
-from typing import Annotated, List, TypedDict, Literal, Optional
+from pydantic import BaseModel, Field, create_model, model_validator
+from typing import Annotated, List, TypedDict, Literal, Optional, Type, Any
 """Add context specific metadata to a type.
 Example: Annotated[int, runtime_check.Unsigned] indicates to the
 hypothetical runtime_check module that this type is an unsigned int."""
@@ -16,20 +16,40 @@ from langgraph.constants import Send # to call any number of parallel nodes
 from langgraph.graph import END, MessagesState, START, StateGraph # esentials for graphs
 from langgraph.errors import NodeInterrupt
 
+import utils.functions as fn
+
 ### LLM
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0) 
 
 ### Schema
 
+# create a dynamic Pydantic model
+def create_dynamic_model(fields: dict) -> BaseModel:
+    DynamicModel = create_model('DynamicParams', **fields, __base__=BaseModel)
+    return DynamicModel()
+
+def get_class_description(instance: BaseModel) -> str:
+    model_class = type(instance)
+    return model_class.model_json_schema()
+
 class messageClass(BaseModel):
     content:str
 
 class Action(BaseModel):
-    id:int
-    type:str # (gmail, bank, erp...)
-    name:str
-    confirmed:bool = True #if the action can be done
+    id: int
+    type: str  # (gmail, bank, erp...)
+    name: str
+    confirmed: bool = True  # if the action can be done
+    params: Optional[dict[str, Any]] = None
+    function: Optional[str] = None
+
+""" @model_validator(mode='before')
+def check_params(cls, values):
+    params = values.get('params')
+    if params is not None and not issubclass(type(params), BaseModel):
+        raise ValueError("(custom error) params must be a subclass of BaseModel and cannot be None")
+    return values """
 
 class ActionsDB(BaseModel):
     actions:List[Action]
@@ -61,10 +81,11 @@ class ToyStoredProceduresDB(BaseModel):
     stored_procedures:ToyStoredProceduresDB
  """
 
-class ExecutorState(MessagesState): 
+""" class ExecutorState(MessagesState): 
     #we use messages to store the questions from the agent and answers from the user
     procedure:Procedure
     done_actions:List[Action] = [] #to store the actions done by the executor
+ """
 
 class GeneralState(MessagesState): #this is the general state with the general data needed.
     request:str
@@ -75,6 +96,7 @@ class GeneralState(MessagesState): #this is the general state with the general d
     pending_actions:List[Action]
     done_actions: List[Action]
     actions_database:ActionsDB
+    data: Optional[dict[str, Any]] = None
 
 class CreatorState(MessagesState):
     actions:List[Action] #to store the actions to create the procedure
@@ -117,6 +139,12 @@ def select_procedure(state: GeneralState):
     else:
         message = request
         
+    # check if the procedure has valid actions
+    for action in stored_procedures.procedures[0].actions:
+
+        raise NodeInterrupt(get_class_description(action))
+    
+    
     # Enforce structured output to get the index of the procedure
     structured_llm = llm.with_structured_output(BestProcedure) 
     
@@ -125,6 +153,8 @@ def select_procedure(state: GeneralState):
 
     # select procedure
     procedure_id = structured_llm.invoke([SystemMessage(content=system_message)]+messages+[HumanMessage(content=message)])
+
+
 
     #raise NodeInterrupt({type(stored_procedures)})
 
@@ -153,7 +183,6 @@ def human_feedback_confirm(state: GeneralState):
 
 def human_feedback_create(state: CreatorState):
     pass
-
 
 # Executor workflow
 
@@ -189,47 +218,78 @@ def executor(state: GeneralState):
     actions = state.get("pending_actions", [])
     messages = state.get('messages', [])
     human_feedback_select_message = state.get('human_feedback_select_message', '')
-
     if human_feedback_select_message.lower() == "approve":
         messages.append(HumanMessage(content="I confirm the procedure"))
         human_feedback_select_message = ""
 
     for action in actions:
-
-        #next_action = action
         confirmed = action.confirmed
 
-        if human_feedback_confirm_message.lower() == 'yes':
-            messages.append(HumanMessage(content="I confirm the action"))
-            confirmed = True
-        if human_feedback_confirm_message.lower() == 'no':
-            messages.append(HumanMessage(content="I don't confirm the action, end this conversation."))
-            actions = []
-            return {
-                    "messages": messages,
-                    "human_feedback_confirm_message": "",
-                    "human_feedback_select_message": "",
-                    "done_actions": done_actions, 
-                    "pending_actions": actions,
-                    }
+        fields = {
+            'message': (str, Field(description="The message to send to the user, related to the value in 'bool' field. It can be just a short notification of the filled params, or a question to the user")),
+            'bool': (bool, Field(description="If you can fill the parameters with the conversation info")),
+            'params': (Optional[action.params], Field(default=None, description="The parameters to fill the action. Fill it if 'bool' is True, otherwise leave it empty"))
+        }
 
-        if confirmed:
-            done_actions.append(action)
-            actions = actions[1:]
+        DynamicParams = create_dynamic_model(fields)
 
-            human_feedback_confirm_message = ""
+        # puedo llenar los parametros de esta accion con la info que tengo en la conversacion?
+        structured_llm = llm.with_structured_output(fields, method="json_schema") # cambiar esto: bool, message, params:(si !bool, vacio)
+        response = structured_llm.invoke([SystemMessage(content=f"Can you select the action params with security based on conversation? {action.params}")]+messages)
+        messages.append(AIMessage(content=response.message))
+
+        # si puedo, me fijo si esta confirmada y la llamo
+        if response.bool: 
+            action.params = response.params
+
+            if human_feedback_confirm_message.lower() == 'yes':
+                messages.append(HumanMessage(content="I confirm the action"))
+                confirmed = True
+
+            if human_feedback_confirm_message.lower() == 'no':
+                messages.append(HumanMessage(content="I don't confirm the action, end this conversation."))
+                actions = []
+                return {
+                        "messages": messages,
+                        "human_feedback_confirm_message": "",
+                        "human_feedback_select_message": "",
+                        "done_actions": done_actions, 
+                        "pending_actions": actions,
+                        }
+
+            # (fijarse si esta confirmada )
+            if confirmed:
+                done_actions.append(action)
+                actions = actions[1:]
+                human_feedback_confirm_message = ""
+
+                # llamarla:
+                func = action.function
+                func(action.params)
+
+            else:
+
+                messages.append(AIMessage(content=f"The action {action.name} needs your confirmation"))
+
+                return {
+                        "messages": messages,
+                        "human_feedback_confirm_message": "",
+                        "human_feedback_select_message": "",
+                        "done_actions": done_actions, 
+                        "pending_actions": actions,
+                        }
+    
+        # si no puedo, le pido feedback al usuario
         else:
-
-            messages.append(AIMessage(content=f"The action {action.name} needs your confirmation"))
-
             return {
-                    "messages": messages,
-                    "human_feedback_confirm_message": "",
-                    "human_feedback_select_message": "",
-                    "done_actions": done_actions, 
-                    "pending_actions": actions,
-                    }
-        
+                "messages": messages,
+                "human_feedback_confirm_message": "",
+                "human_feedback_select_message": "",
+                "done_actions": done_actions, 
+                "pending_actions": actions,
+            }
+
+   
     return {
             "done_actions": done_actions, 
             "pending_actions": actions, 
@@ -312,6 +372,51 @@ def start(state: GeneralState):
 
     else: return {"stored_procedures": ToyStoredProceduresDB(procedures=[
         Procedure(
+            description="create new order in system",
+            actions=[
+                Action(
+                    id=9, name="select the system url", type="erp", confirmed=True,
+                    params=create_dynamic_model({"url": (Optional[str], Field(default=None, description="The url to send the order"))}),
+                    function="fetch_page"),
+                Action(
+                    id=10, name="send main order information to system", type="erp", confirmed=True,
+                    params=create_dynamic_model({"url": (Optional[str], Field(default=None, description="The url to send the order"))}),
+                    function="fetch_page"),
+                Action(id=11, name="create option for the order", type="erp", confirmed=True,
+                    params=create_dynamic_model({"url": (Optional[str], Field(default=None, description="The url to send the order"))}),
+                    function="fetch_page"),
+                Action(id=12, name="add products to the last order", type="erp", confirmed=True,
+                    params=create_dynamic_model({"url": (Optional[str], Field(default=None, description="The url to send the order"))}),
+                    function="fetch_page"),
+            ]
+        )
+    ]),
+    """ "actions_database": ActionsDB(actions=[
+        Action(id=0, name="read last 10 emails and find the bill", type="gmail", confirmed=True),
+        Action(id=1, name="load bill into erp", type="erp", confirmed=True),
+        Action(id=2, name="send payment to provider", type="bank", confirmed=False),
+        Action(id=3, name="calculate monthly hours per employee", type="google sheets", confirmed=True),
+        Action(id=4, name="load results into erp", type="erp", confirmed=True),
+        Action(id=5, name="send payment to employees", type="bank", confirmed=False),
+        Action(id=6, name="load last month data from erp", type="erp", confirmed=True),
+        Action(id=7, name="calculate profits and costs", type="calculator", confirmed=True),
+        Action(id=8, name="generate sections", type="agents", confirmed=True),
+        Action(id=9, name="generate report", type="report generator", confirmed=True),
+        Action(id=10, name="schedule a meeting with the team", type="calendar", confirmed=True),
+        Action(id=11, name="order office supplies", type="inventory", confirmed=False),
+        Action(id=12, name="backup company data", type="IT", confirmed=True),
+        Action(id=13, name="update employee contact information", type="HR", confirmed=True),
+        Action(id=14, name="approve leave requests", type="HR", confirmed=False),
+        Action(id=15, name="prepare quarterly financial report", type="finance", confirmed=False),
+        Action(id=16, name="conduct employee performance reviews", type="HR", confirmed=True),
+        Action(id=17, name="organize team-building activities", type="HR", confirmed=True),
+        Action(id=18, name="review and approve expense reports", type="finance", confirmed=False),
+        Action(id=19, name="update company website", type="IT", confirmed=True)
+    ]),  """
+    "human_feedback_select_message": "approve"
+    }
+
+    """ Procedure(
             description="review last bill received in gmail and pay it",
             actions=[
                 Action(id=0, name="read last 10 emails and find the bill", type="gmail", confirmed=True),
@@ -335,32 +440,7 @@ def start(state: GeneralState):
                 Action(id=8, name="generate sections", type="agents", confirmed=True),
                 Action(id=9, name="generate report", type="report generator", confirmed=True)
             ]
-        )
-    ]),
-    "actions_database": ActionsDB(actions=[
-        Action(id=0, name="read last 10 emails and find the bill", type="gmail", confirmed=True),
-        Action(id=1, name="load bill into erp", type="erp", confirmed=True),
-        Action(id=2, name="send payment to provider", type="bank", confirmed=False),
-        Action(id=3, name="calculate monthly hours per employee", type="google sheets", confirmed=True),
-        Action(id=4, name="load results into erp", type="erp", confirmed=True),
-        Action(id=5, name="send payment to employees", type="bank", confirmed=False),
-        Action(id=6, name="load last month data from erp", type="erp", confirmed=True),
-        Action(id=7, name="calculate profits and costs", type="calculator", confirmed=True),
-        Action(id=8, name="generate sections", type="agents", confirmed=True),
-        Action(id=9, name="generate report", type="report generator", confirmed=True),
-        Action(id=10, name="schedule a meeting with the team", type="calendar", confirmed=True),
-        Action(id=11, name="order office supplies", type="inventory", confirmed=False),
-        Action(id=12, name="backup company data", type="IT", confirmed=True),
-        Action(id=13, name="update employee contact information", type="HR", confirmed=True),
-        Action(id=14, name="approve leave requests", type="HR", confirmed=False),
-        Action(id=15, name="prepare quarterly financial report", type="finance", confirmed=False),
-        Action(id=16, name="conduct employee performance reviews", type="HR", confirmed=True),
-        Action(id=17, name="organize team-building activities", type="HR", confirmed=True),
-        Action(id=18, name="review and approve expense reports", type="finance", confirmed=False),
-        Action(id=19, name="update company website", type="IT", confirmed=True)
-    ]), 
-    "human_feedback_select_message": "approve"
-    }
+        ), """
 
 def save_procedure(state: CreatorState):
 
@@ -394,14 +474,14 @@ def decide_execute_end(state: GeneralState):
     """ Conditional edge to initiate executor or return to orchestrator """ 
 
     pending_actions = state.get('pending_actions', [])
-    human_feedback_confirm_message=state.get('human_feedback_confirm_message','')
+    human_feedback_confirm_message =state.get('human_feedback_confirm_message','')
+    human_feedback_select_message = state.get('human_feedback_select_message', '')
 
-    # Check if human feedback
     if pending_actions == []:
-
         return "start" # if user cancels OR all tasks are done just finish the execution
-    elif human_feedback_confirm_message != '':
+    elif human_feedback_confirm_message != '' or human_feedback_select_message != '':
         return "executor"
+    
     ***REMOVED***wise 
     else:
         raise NodeInterrupt("There are still actions pending")
@@ -491,7 +571,6 @@ builder.add_node("create_procedure", create_procedure)
 builder.add_node("human_feedback_create", human_feedback_create)
 builder.add_node("save_procedure", save_procedure)
 
-
 # Logic
 builder.add_edge(START, "start")
 builder.add_conditional_edges("start", decide_create_select, ["create_procedure", "select_procedure"])
@@ -506,4 +585,4 @@ builder.add_edge("executor", "human_feedback_confirm")
 builder.add_conditional_edges("human_feedback_confirm", decide_execute_end, ["executor", "start"])
 
 # Compile
-graph = builder.compile(interrupt_before=['human_feedback_select', 'human_feedback_create'], interrupt_after=['start'])
+graph = builder.compile(interrupt_before=['human_feedback_create'], interrupt_after=['start']) #'human_feedback_select', 

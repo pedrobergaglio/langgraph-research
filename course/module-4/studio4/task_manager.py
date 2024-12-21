@@ -30,8 +30,6 @@ class Action(BaseModel):
     type:str # (gmail, bank, erp...)
     name:str
     confirmed:bool = True #if the action can be done
-    #params:Optional[dict] = None
-    #function:Optional[str] = None
 
 class ActionsDB(BaseModel):
     actions:List[Action]
@@ -336,14 +334,6 @@ def start(state: GeneralState):
                 Action(id=7, name="calculate profits and costs", type="calculator", confirmed=True),
                 Action(id=8, name="generate sections", type="agents", confirmed=True),
                 Action(id=9, name="generate report", type="report generator", confirmed=True)
-            ]
-        ),
-        Procedure(
-            description="create new order in system",
-            actions=[
-                Action(id=10, name="send main order information to system", type="erp", confirmed=True),
-                Action(id=11, name="create option for the order", type="erp", confirmed=True),
-                Action(id=12, name="add products to the last order", type="erp", confirmed=True),
             ]
         )
     ]),
