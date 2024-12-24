@@ -4,3 +4,6 @@ langchain-community
 langchain-openai
 tavily-python
 wikipedia
+colorama
+llama_index.core
+pymysql
