@@ -7,3 +7,4 @@ wikipedia
 colorama
 llama_index.core
 pymysql
+llama-index-embeddings-openai

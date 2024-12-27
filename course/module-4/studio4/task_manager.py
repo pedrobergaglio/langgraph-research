@@ -31,10 +31,6 @@ tuteando y usando modismos argentinos apropiados para un ambiente laboral.
 class messageClass(BaseModel):
     content:str
 
-class CanFillResponse(BaseModel):
-    can_fill: bool
-    message: str
-
 class ActionsDB(BaseModel):
     actions:List[Action]
 
@@ -70,6 +66,8 @@ class GeneralState(MessagesState): #this is the general state with the general d
     done_actions: List[Action]
     actions_database:ActionsDB
     data: Optional[dict[str, Any]] = None
+    vector_index: Any
+    options: Optional[List[str]] = None
 
 """ class CreatorState(MessagesState):
     actions:List[Action] #to store the actions to create the procedure
@@ -175,19 +173,51 @@ When you are satisfied with your understanding, complete the interview with: "Th
 Remember to stay in character throughout your response, reflecting the persona and goals provided to you."""
 
 def filter_required_fields(schema: dict) -> dict:
-    """Remove null-union fields from schema"""
-    filtered_properties = {}
-    for field, props in schema["properties"].items():
-        if not (isinstance(props.get("type"), list) and "null" in props["type"]):
-            filtered_properties[field] = props
+    def is_optional(field_schema):
+        return (isinstance(field_schema.get("type"), list) and 
+                "null" in field_schema["type"])
     
-    return {
-        "title": schema["title"],
-        "type": "object",
-        "properties": filtered_properties,
-        "required": [f for f in filtered_properties.keys()]
-    }
+    def filter_field(field_schema, depth=0):
+        if not isinstance(field_schema, dict) or depth > 3:
+            return None
+            
+        filtered_schema = field_schema.copy()
+        
+        # Check if field is optional
+        if is_optional(field_schema):
+            return None
+            
+        # Handle array items
+        if "items" in field_schema:
+            filtered_items = filter_field(field_schema["items"], depth + 1)
+            if filtered_items is None:
+                return None
+            filtered_schema["items"] = filtered_items
+            filtered_schema["type"] = "array"
+            
+        # Handle object properties
+        if "properties" in field_schema:
+            filtered_props = {}
+            for prop_name, prop_schema in field_schema["properties"].items():
+                filtered_prop = filter_field(prop_schema, depth + 1)
+                if filtered_prop is not None:
+                    filtered_props[prop_name] = filtered_prop
+            
+            if not filtered_props:
+                return None
+                
+            filtered_schema["properties"] = filtered_props
+            
+            if "required" in field_schema:
+                required = [r for r in field_schema["required"] 
+                          if r in filtered_props]
+                if required:
+                    filtered_schema["required"] = required
+                
+        return filtered_schema
 
+    filtered = filter_field(schema)
+    return filtered if filtered is not None else {"type": "object", "properties": {}}
 # here we are already using the state for the executor, completely uncoupled from the other states.
 # here the executor executes the selected procedure
 def executor(state: GeneralState):
@@ -213,69 +243,340 @@ def executor(state: GeneralState):
     for action in actions:
 
         # If the action has no params but has a params schema, we need to fill them
-        if not action.params and action.params_schema:
+        if (not action.params and action.params_schema) or (action.params and human_feedback_select_message.lower() != ""):
 
-            # Filter schema to only required fields
-            required_schema = filter_required_fields(action.params_schema)
-
-            # First request: Can we fill the params?
-            decision_llm = llm.with_structured_output(
-                CanFillResponse,
-                method="json_schema",
-                strict=True,
-            )
+            for i in range(5):
             
-            can_fill = decision_llm.invoke([
-                SystemMessage(content=general_instructions+f"""
-            Analyze if we can fill these parameters based on information provided in the conversation.
+                # Filter schema to only required fields
+                required_schema = filter_required_fields(action.params_schema)
 
-            RULES FOR REQUIRED FIELDS:
-            1. Only use data explicitly provided in the conversation
-            2. Required fields must have actual values from conversation
-            3. List any missing fields when asking user
+                can_fill_schema = {
+                    "title": "CanFillResponse", 
+                    "type": "object",
+                    "properties": {
+                        "can_fill": {
+                            "type": "string",
+                            "enum": ["false", "true", "CLIENTES", "PRODUCTS"]
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Message to display to user, or search query"
+                        }
+                    },
+                    "required": ["can_fill", "text"]
+                }
 
-            Response format:
-            - If all parameters can be filled:
-              can_fill: true
-              message: List the exact values you'll use
-            - If any parameter is missing:
-              can_fill: false
-              message: List the missing required fields in a conversational way in one sentence.
-
-            Schema: {required_schema}
-            """)
-            ] + messages)
-
-            # If we can fill the params, we need to fill them
-            if can_fill.can_fill:
-                # Second request: Fill the params
-                params_llm = llm.with_structured_output(
-                    action.params_schema,
-                    method="json_schema",
+                # First request: Can we fill the params?
+                decision_llm = llm.with_structured_output(
+                    can_fill_schema,
+                    method="json_schema", 
                     strict=True
                 )
                 
-                filled_params = params_llm.invoke([
-                    SystemMessage(content=general_instructions+"Fill the parameters based on the conversation context")
-                ] + messages)
-                
-                action.params = filled_params
-                data.update(filled_params)
-                # Also pass the action metadata to the data
-                if action.metadata:
-                    data.update(action.metadata)
+                can_fill = decision_llm.invoke([
+                    SystemMessage(content=general_instructions+f"""
+                Analyze if we can fill these parameters based on information provided in the conversation, 
+                or if the user has provided new data in the last message.
 
-            # If we can't fill the params, we need to ask the user  
-            else:
-                messages.append(AIMessage(content=can_fill.message))
-                return {
-                        "messages": messages,
-                        "human_feedback_action_message": "",
-                        "human_feedback_select_message": "",
-                        "done_actions": done_actions, 
-                        "pending_actions": actions,
-                        "data": data,
+                RULES FOR REQUIRED FIELDS:
+                1. Only use data explicitly provided in the conversation 
+                2. Required fields must have actual values from conversation
+                3. IDs from CLIENTES or PRODUCTS tables must be actual IDs, not names/descriptions
+                4. List any missing fields when asking user
+                5. BEFORE CALLING THE ID AND PRODUCT SEARCH, MAKE SURE THE USER PROVIDED ALL THE OTHER REQUIRED FIELDS
+
+                ---               
+
+                Response options:
+                - If all parameters can be filled with data from conversation:
+                RULES FOR REQUIRED FIELDS:
+                can_fill: true 
+                message: List the exact values you'll use
+                                  
+                - If any other parameter is missing:
+                can_fill: false
+                message: List the missing required fields in a conversational way in one sentence
+                
+                - If  client ID is not in chat history and you still need to lookup a client ID:
+                can_fill: CLIENTES
+                message: Write a short query focused on name/document/business to search the vector index, it's not a message for the user.
+                Example: "Jorge Botta" or "CUIT 20123456789"
+                Do NOT include any extra text - just the search terms.
+                
+                - If product ID is not in chat history and you still need to lookup a product ID:
+                can_fill: PRODUCTS  
+                message: Write a short product query to search the vector index, it's not a message for the user.
+                Example: "Rueda 14" or "Tornillo M8"
+                Do NOT include any extra text - just the search terms.
+
+                Schema: {required_schema}
+
+                ---
+
+                BEFORE REPLY, ANALYZE THE FOLLOWING QUESTIONS:
+
+                - DID THE USER PROVIDE ALL THE REQUIRED FIELDS? 
+                IF NOT, RETURN FALSE, WHAT ARE ALL THE VALUES THAT ARE MISSING?
+
+                - DO YOU HAVE THE CLIENT ID IN THE CHAT HISTORY?
+                IF NOT, DO YOU HAVE THE CLIENT NAME? IF SO, RETURN CLIENTES AND THE CLIENT NAME
+
+                - DO YOU HAVE THE PRODUCT ID IN THE CHAT HISTORY?
+                IF NOT, DO YOU HAVE THE PRODUCT NAME? IF SO, RETURN PRODUCTS AND THE PRODUCT NAME
+
+                - DID THE USER PROVIDE UPDATES TO THE DATA IN THE LAST MESSAGE ABOUT THE PREVIOUSLY FILLED PARAMS?
+                IF SO, USE THAT DATA TO FILL AGAIN THE PARAMS, SELECTING TRUE. 
+
+
+                """)
+                ] + messages)
+
+                # If we can fill the params, we need to fill them
+                if can_fill["can_fill"] == "true":
+
+                    # Fill the params
+                    params_llm = llm.with_structured_output(
+                        action.params_schema,
+                        method="json_schema",
+                        strict=True
+                    )
+                    
+                    filled_params = params_llm.invoke([
+                        SystemMessage(content=general_instructions+"Fill the parameters based on the conversation context")
+                    ] + messages)
+
+                    # log the filled params for the llms to have context:
+                    message = AIMessage(content=f"Filled params: {filled_params}")
+                    message.name = 'log'
+                    messages.append(message)
+                    
+                    action.params = filled_params
+                    data.update(filled_params)
+                    # Also pass the action metadata to the data
+                    if action.metadata:
+                        data.update(action.metadata)
+                    
+                    # If we have all the params, we can break the loop
+                    break
+
+                elif can_fill["can_fill"] == "CLIENTES":
+                    vector_index_dict = state.get("vector_index", {})
+                    if not vector_index_dict:
+                        raise ValueError("Vector index not found in state")
+
+                    test_retriever = vector_index_dict["CLIENTES"].as_retriever(similarity_top_k=5)
+                    nodes = test_retriever.retrieve(can_fill["text"])
+                    
+                    # Define schema for client matching results
+                    client_match_schema = {
+                        "title": "ClientMatch",
+                        "type": "object",
+                        "properties": {
+                            "matches": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "CLIENTE": {"type": "string"},
+                                        "DNI_CUIT": {"type": "string"},
+                                        "ID": {"type": "string"}
+                                    },
+                                    "required": ["CLIENTE", "DNI_CUIT", "ID"]
+                                }
+                            }
+                        },
+                        "required": ["matches"]
+                    }
+
+                    # Get matches using structured LLM with schema
+                    client_match_llm = llm.with_structured_output(client_match_schema, method="json_schema")
+
+                    matches_dict = client_match_llm.invoke([
+                        SystemMessage(content=f"""You are a client matching assistant.
+                        Found these client records:
+                        {[n.metadata for n in nodes]}
+                        
+                        Query: {can_fill["text"]}
+
+                        RETURN EXACT JSON FORMAT:
+                        {{
+                            "matches": [
+                                {{
+                                    "CLIENTE": "Client name",
+                                    "DNI_CUIT": "299103940",
+                                    "ID": "Client ID"
+                                }}
+                            ]
+                        }}
+
+                        RULES:
+                        - Match exact field names (CLIENTE, DNI_CUIT)
+                        - Include all relevant matches
+                        - Empty matches should be []
+                        """)
+                    ])
+                    
+
+                    # No matches found 
+                    if len(matches_dict["matches"]) == 0:
+                        response = llm.invoke([SystemMessage(content=general_instructions+f"Send a one sentence message for the user, telling that couldnt found {can_fill['text']} in the database")]+messages)
+                        messages.append(AIMessage(content=response.content))
+                        return {
+                                "messages": messages, 
+                                "human_feedback_action_message": "",
+                                "human_feedback_select_message": "",
+                                "done_actions": done_actions,
+                                "pending_actions": actions,
+                                "data": data,
+                        "options": None,
                         }
+
+                    # Single exact match found
+                    elif len(matches_dict["matches"]) == 1:
+                        match = matches_dict["matches"][0]
+                        message = AIMessage(content=f"CLIENT ID READY TO SEND, THERE'S NO NEED FOR ANOTHER CLIENTES SEARCH FOUND: CLIENT ID:{match['ID']}, name: {match['CLIENTE']}")
+                        message.name = 'log'
+                        messages.append(message)
+
+                    # Multiple potential matches found
+                    else:
+                        llm_str = llm.with_structured_output(messageClass)
+                        response = llm_str.invoke([SystemMessage(content=general_instructions+"Send a one sentence message to the user explaining that multiple clients were found and asking them to select the correct one using the buttons below")]+messages)
+                        messages.append(AIMessage(content=response.content))
+                        return {
+                            "messages": messages,
+                            "human_feedback_action_message": "",
+                            "human_feedback_select_message": "", 
+                            "done_actions": done_actions,
+                            "pending_actions": actions,
+                            "data": data,
+                            "options": [
+                                f"{m['CLIENTE']} CUIT: {m['DNI_CUIT']}" 
+                                for m in matches_dict["matches"]
+                            ]
+                        }
+
+                elif can_fill["can_fill"] == "PRODUCTS":
+                    vector_index_dict = state.get("vector_index", {})
+                    if not vector_index_dict:
+                        raise ValueError("Vector index not found in state")
+
+                    test_retriever = vector_index_dict["PRODUCTS"].as_retriever(similarity_top_k=5)
+                    nodes = test_retriever.retrieve(can_fill["text"])
+                    
+                    # Define schema for product matching results
+                    product_match_schema = {
+                        "title": "ProductMatch",
+                        "type": "object",
+                        "properties": {
+                            "matches": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "product": {"type": "string"},
+                                        "id": {"type": "string"},
+                                        "supplier": {"type": "string"},
+                                        "brand": {"type": "string"}
+                                    },
+                                    "required": ["product", "id", "supplier", "brand"]
+                                }
+                            }
+                        },
+                        "required": ["matches"]
+                    }
+
+                    # Get matches using structured LLM with schema
+                    product_match_llm = llm.with_structured_output(product_match_schema, method="json_schema")
+
+                    matches_dict = product_match_llm.invoke([
+                        SystemMessage(content=f"""You are a product matching assistant.
+                        Found these product records:
+                        {[n.metadata for n in nodes]}
+                        
+                        Query: {can_fill["text"]}
+
+                        RETURN EXACT JSON FORMAT:
+                        {{
+                            "matches": [
+                                {{
+                                    "product": "Product name",
+                                    "id": "Product ID",
+                                    "supplier": "Supplier name",
+                                    "brand": "Brand name"
+                                }}
+                            ]
+                        }}
+
+                        RULES:
+                        - Match exact field names
+                        - Include ALL relevant matches. If you discard any relevant, the system will break. 
+                        - If you are in doubt about a record, just add it so the user can decide.
+                        - Empty matches should be []
+                        """)
+                    ])
+
+                    # No matches found 
+                    if len(matches_dict["matches"]) == 0:
+                        response = llm.invoke([SystemMessage(content=general_instructions+f"Send a one sentence message for the user, telling that couldn't find {can_fill['text']} in the database")]+messages)
+                        messages.append(AIMessage(content=response.content))
+                        return {
+                                "messages": messages, 
+                                "human_feedback_action_message": "",
+                                "human_feedback_select_message": "",
+                                "done_actions": done_actions,
+                                "pending_actions": actions,
+                                "data": data,
+                                "options": None,
+                        }
+
+                    # Single exact match found
+                    elif len(matches_dict["matches"]) == 1:
+                        match = matches_dict["matches"][0]
+                        message = AIMessage(content=f"PRODUCT ID, THERE'S NO NEED TO MAKE ANOTHER PRODUCTS SEARCH found: PRODUCT ID: {match['id']}, name: {match['product']}")
+                        message.name = 'log'
+                        messages.append(message)
+
+                    # Multiple potential matches found
+                    else:
+                        llm_str = llm.with_structured_output(messageClass)
+                        response = llm_str.invoke([SystemMessage(content=general_instructions+"Send a one sentence message to the user explaining that multiple products were found and asking them to select the correct one using the buttons below, and ask the user to give more feedback if none of those are correct")]+messages)
+                        messages.append(AIMessage(content=response.content))
+
+                        options = [
+                            f"PRODUCT NAME: {m['product']} (PRODUCT ID: {m['id']})" 
+                            for m in matches_dict["matches"]
+                        ]
+
+                        # log the options for the llms to have context:
+                        message = AIMessage(content=f"Options PRODUCT NAME (PRODUCT ID): {options}")
+                        message.name = 'log'
+                        messages.append(message)
+
+                        return {
+                            "messages": messages,
+                            "human_feedback_select_message": "", 
+                            "done_actions": done_actions,
+                            "pending_actions": actions,
+                            "data": data,
+                            "options": [
+                                f"{m['product']} ({m['brand']}) - ID: {m['id']}" 
+                                for m in matches_dict["matches"]
+                            ]
+                        }
+
+                # If we can't fill the params, we need to ask the user  
+                else:
+                    messages.append(AIMessage(content=can_fill["text"]))
+                    return {
+                            "messages": messages,
+                            "human_feedback_action_message": "",
+                            "human_feedback_select_message": "",
+                            "done_actions": done_actions, 
+                            "pending_actions": actions,
+                            "data": data,
+                        "options": None,
+                            }
 
         # Once we have the params, check action confirmation and execute
         confirmed = action.confirmed
@@ -326,7 +627,8 @@ def executor(state: GeneralState):
                         "human_feedback_select_message": "",
                         "done_actions": done_actions, 
                         "pending_actions": actions,
-                        "data": data
+                        "data": data,
+                    "options": None,
                     }
                         
                 except Exception as e:
@@ -340,7 +642,8 @@ def executor(state: GeneralState):
                         "human_feedback_select_message": "",
                         "done_actions": done_actions, 
                         "pending_actions": actions,
-                        "data": data
+                        "data": data,
+                    "options": None,
                     }
             
             # There is no function to execute
@@ -357,7 +660,11 @@ def executor(state: GeneralState):
             message.name = 'log'
             messages.append(message)
             llm_str = llm.with_structured_output(messageClass)
-            response = llm_str.invoke([SystemMessage(content=general_instructions+"Send a one sentence message to the user to ask for confirmation of the action")])
+            response = llm_str.invoke([SystemMessage(content=general_instructions+f"""Send a message to the user asking for confirmation to execute '{action.name}'.
+            Generate a brief overview of the action
+            1. Action name: {action.name}
+            2. Parameters that will be used: {json.dumps(action.params, indent=2) if action.params else 'No parameters'}
+            Format this nicely and ask if they want to proceed.""")]+messages)
             messages.append(AIMessage(content=response.content))
             return {
                     "messages": messages,
@@ -365,7 +672,8 @@ def executor(state: GeneralState):
                     "human_feedback_select_message": "",
                     "done_actions": done_actions, 
                     "pending_actions": actions,
-                    "data": data
+                    "data": data,
+                    "options": None,
                     }
 
 
@@ -374,6 +682,7 @@ def executor(state: GeneralState):
                         "messages": messages,
                         "human_feedback_action_message": "",
                         "human_feedback_select_message": "",
+                        "options": None,
                         "done_actions": done_actions, 
                         "pending_actions": actions,
                         }
@@ -450,178 +759,141 @@ def start(state: GeneralState):
         messages.append(AIMessage(content=response.content))
         return {"messages": messages}
 
-    else: return {"stored_procedures": ToyStoredProceduresDB(procedures=[
+    else: 
+        
+        vector_index_dict = fn.index_from_storage()
+        
+        return {"vector_index": vector_index_dict,
+            "stored_procedures": ToyStoredProceduresDB(procedures=[
+        
         Procedure(
-            description="random test procedure [DO NOT USE]",
-            actions=[
-                Action(
-                    id=9, 
-                    name="select the system url", 
-                    type="erp", 
-                    confirmed=True,
-                    params_schema={
-                        "title": "URLParams",
-                        "description": "Parameters for sending an order to a URL",
-                        "type": "object",
-                        "properties": {
-                            "url": {
-                                "type": "string",
-                                "description": "The url to send the order. Make sure it's a valid url with https://"
-                            }
-                        },
-                        "required": ["url"]
-                    },
-                    metadata={"table_name": "PEDIDOS"}, 
-                    function="fetch_page"
-                ),
-                Action(
-                    id=10, 
-                    name="send main order information to system", 
-                    type="erp", 
-                    confirmed=True,
-                    params_schema={
-                        "title": "URLParams",
-                        "description": "Parameters for sending an order to a URL, the user has to provide it, there's no default value",
-                        "type": "object",
-                        "properties": {
-                            "url": {
-                                "type": "string",
-                                "description": "The url to send the order, the user has to provide it, there's no default value"
-                            }
-                        },
-                        "required": ["url"]
-                    },
-                    function="fetch_page"
-                ),
-                Action(
-                    id=11, 
-                    name="create option for the order", 
-                    type="erp", 
-                    confirmed=True,
-                    params_schema={
-                        "title": "URLParams",
-                        "description": "Parameters for sending an order to a URL",
-                        "type": "object",
-                        "properties": {
-                            "url": {
-                                "type": "string",
-                                "description": "The url to send the order, the user has to provide it, there's no default value"
-                            }
-                        },
-                        "required": ["url"]
-                    },
-                    function="fetch_page"
-                ),
-                Action(
-                    id=12, 
-                    name="add products to the last order", 
-                    type="erp", 
-                    confirmed=True,
-                    params_schema={
-                        "title": "URLParams",
-                        "description": "Parameters for sending an order to a URL",
-                        "type": "object",
-                        "properties": {
-                            "url": {
-                                "type": "string",
-                                "description": "The url to send the order"
-                            }
-                        },
-                        "required": ["url"]
-                    },
-                    function="fetch_page"
-                ),
-            ]
-        ),
-        Procedure(
-        description="TEST TEST TEST TEST. ONLY USE IF SPECIFIED A TEST BY THE USER. create new order in system",
+        description="PRODUCTION READY. Create new estimante/order in system",
         actions=[
             Action(
-                id=13, 
-                name="send the main order info to the system",
-                type="erp",
-                confirmed=True,
-                params_schema={
-                    "title": "Order",
-                    "type": "object",
-                    "properties": {
-                        "ID_CLIENTE": {
-                            "type": "string",
-                            "description": "Client ID"
-                        },
-                        "TIPO_DE_ENTREGA": {
-                            "type": "string",
-                            "enum": ["CLIENTE", "RETIRA EN FÁBRICA", "OTRO"],
-                            "description": "Delivery type"
-                        },
-                        "METODO_DE_PAGO": {
-                            "type": "string",
-                            "enum": ["EFECTIVO", "DÓLARES", "MERCADO PAGO", "CHEQUE", "TRANSFERENCIA BANCARIA"],
-                            "description": "Payment method"
-                        },
-                        "DIRECCION": {
-                            "type": ["string", "null"],
-                            "description": "Optional delivery address. Leave empty if not needed.",
-                        },
-                        "NOTA": {
-                            "type": ["string", "null"],
-                            "description": "Optional note. Leave empty if not needed.",
-                        }
-                    },
-                    "required": ["ID_CLIENTE", "TIPO_DE_ENTREGA", "METODO_DE_PAGO", "DIRECCION", "NOTA"]
+            id=13, 
+            name="save the estimate/order info, without sending it into the system",
+            type="erp",
+            confirmed=False,
+            params_schema={
+            "title": "Order",
+            "type": "object",
+            "properties": {
+            "ID_CLIENTE": {
+                "type": "string",
+                "description": "Client ID"
+            },
+            "TIPO_DE_ENTREGA": {
+                "type": "string",
+                "enum": ["CLIENTE", "RETIRA EN FÁBRICA", "OTRO"],
+                "description": "Delivery type"
+            },
+            "VENDEDOR": {
+                "type": "string",
+                "enum": ["ESTEBAN", "FLORENCIA", "NICOLAS", "PATRICIA", "FEDERICO", "Prueba"],
+                "description": "The user that is talking to you, ask his name, there's no default"
+            },
+            "OPCIONES": {
+                "type": "array",
+                "items": {
+                "type": "object",
+                "properties": {
+                "MONEDA": {
+                "type": "string",
+                "enum": ["PESO", "DOLAR"],
+                "description": "Currency. Salesperson must define which is the currency to use, There is no default"
                 },
-                metadata={"table_name": "PEDIDOS"},
-                function="create_order",
-                ),
-            Action(
-                id=14,
-                name="add products to the order",
-                type="erp",
-                confirmed=True,
-                params_schema={
-                    "title": "OrderProducts",
+                "PRODUCTOS_PEDIDOS": {
+                "type": "array",
+                "items": {
                     "type": "object",
                     "properties": {
-                        "products": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "ID_PRODUCTO": {
-                                        "type": "integer",
-                                        "title": "Product ID found in the database",
-                                    },
-                                    "TIPO": {
-                                        "type": "string",
-                                        "enum": ["ESTANDAR", "INTENSO", "PIEDRA GRANITO"],
-                                        "title": "Type of the color, each color has a corresponding type in the database"
-                                    },
-                                    "COLOR": {
-                                        "type": "string",
-                                        "title": "Color of the product (TYPE GOES IN THE OTHER FIELD), in the database it is a foreign key",
-                                    },
-                                    "CANTIDAD": {
-                                        "type": "integer",
-                                        "title": "Quantity"
-                                    }
-                                },
-                                "required": ["ID_PRODUCTO", "TIPO", "COLOR", "CANTIDAD"]
-                            }
-                        },
+                    "ID_PRODUCTO": {
+                    "type": "integer",
+                    "description": "Product ID"
                     },
-                    "required": ["products"]
+                    "CANTIDAD": {
+                    "type": "integer",
+                    "description": "Quantity"
                     },
-                    #metadata={"table_name": "PRODUCTOS_PEDIDOS"},
-                    function="add_products_to_order",),
+                    "PRECIO_LISTA_S_IVA": {
+                    "type": ["number", "null"],
+                    "description": "Optional list price without VAT, if not provided, it must be left as null because the system itself will calculate it"
+                    }
+                    },
+                    "required": ["ID_PRODUCTO", "CANTIDAD", "PRECIO_LISTA_S_IVA"]
+                }
+                },
+                "DESCUENTO_GENERAL": {
+                    "type": ["number", "null"],
+                    "description": "General discount"
+                }
+                },
+                "required": ["MONEDA", "PRODUCTOS_PEDIDOS", "DESCUENTO_GENERAL"]
+                }
+            },
+            "CARGAR_COMO_PEDIDO": {
+                "type": ["boolean", "null"],
+                "description": "Defaults to false, because this is actually an estimate, not a confirmed order"
+            }
+            },
+            "required": ["ID_CLIENTE", "TIPO_DE_ENTREGA", "VENDEDOR", "OPCIONES", "CARGAR_COMO_PEDIDO"]
+            },
+            metadata={"table_name": "PEDIDOS"},
+            ),
             Action(
-                    id=15,
-                    name="save order",
-                    type="erp",
-                    confirmed=False,
-                    function="save_order"
-                )
-                ]),
-        Procedure(
+            id=14,
+            name="add products to the order",
+            type="erp",
+            confirmed=True,
+            params_schema={
+            "title": "OrderProducts",
+            "type": "object",
+            "properties": {
+            "products": {
+                "type": "array",
+                "items": {
+                "type": "object",
+                "properties": {
+                "ID_PRODUCTO": {
+                "type": "integer",
+                "title": "Product ID found in the database",
+                },
+                "TIPO": {
+                "type": "string",
+                "enum": ["ESTANDAR", "INTENSO", "PIEDRA GRANITO"],
+                "title": "Type of the color, each color has a corresponding type in the database"
+                },
+                "COLOR": {
+                "type": "string",
+                "title": "Color of the product (TYPE GOES IN THE OTHER FIELD), in the database it is a foreign key",
+                },
+                "CANTIDAD": {
+                "type": "integer",
+                "title": "Quantity"
+                }
+                },
+                "required": ["ID_PRODUCTO", "TIPO", "COLOR", "CANTIDAD"]
+                }
+            },
+            },
+            "required": ["products"]
+            },
+            #metadata={"table_name": "PRODUCTOS_PEDIDOS"},
+            function="add_products_to_order",),
+            Action(
+            id=15,
+            name="save order",
+            type="erp",
+            confirmed=False,
+            function="save_order"
+            )
+            ])],
+        
+         ),
+        "human_feedback_select_message": "approve"
+            }
+
+""" Procedure(
                 description="PRODUCTION READY. Create new order in system",
                 actions=[
             Action(
@@ -709,9 +981,7 @@ def start(state: GeneralState):
                     function="save_order"
                 )
                 ])
-        ]),
-        "human_feedback_select_message": "approve"
-            }
+         """
 
 def save_procedure(state: GeneralState):
 
