@@ -9,6 +9,14 @@ from llama_index.core import SQLDatabase, VectorStoreIndex
 from llama_index.core.retrievers import SQLRetriever
 from llama_index.core.objects import SQLTableNodeMapping
 import json
+from llama_index.core.schema import TextNode
+from pathlib import Path
+from llama_index.core.storage import StorageContext
+from llama_index.core import VectorStoreIndex, load_index_from_storage
+from datetime import datetime
+from tqdm import tqdm
+from decimal import Decimal
+import uuid
 
 load_dotenv()
 
@@ -22,23 +30,21 @@ appsheet_app_id = os.getenv('APPSHEET_APP_ID')
 appsheet_api_key = os.getenv('APPSHEET_API_KEY')
 
 # Construct the connection string
-connection_string = f"mysql+pymysql://{user}:{password}@{host}/{database}"
+connection_string = f"mysql+pymysql://{user}:{password}@{host}/energia_global"
+connection_string_ventas = f"mysql+pymysql://{user}:{password}@{host}/energia_global_ventas"
 
 # Create the engine
 engine = create_engine(connection_string)
+engine_ventas = create_engine(connection_string_ventas)
 
 metadata_obj = MetaData()
 sql_database = SQLDatabase(engine)
-table_node_mapping = SQLTableNodeMapping(sql_database)
-sql_retriever = SQLRetriever(sql_database)
+sql_database_ventas = SQLDatabase(engine_ventas)
+#table_node_mapping = SQLTableNodeMapping(sql_database)
+#sql_retriever = SQLRetriever(sql_database)
 
 # Main functions
 
-
-
-
-
-# API
 def create_order_api(data: dict):
     
     print(Fore.RED + "[create_order] is being executed" + Style.RESET_ALL)
@@ -111,17 +117,6 @@ def add_products_to_order_api(data: dict):
     except Exception as e:
         return {"status": "error", "response": f"API Success but error parsing response: {str(e)}"}
 
-def save_order(data: dict):
-    print(Fore.RED + "[save_order] is being executed" + Style.RESET_ALL)
-
-    order_id = data.get("order_id")
-
-    if not order_id:
-        return {"status": "error", "response": "order_id is required"}
-
-    appsheet_edit({"ID_KEY": order_id, "GUARDADO": 1}, "PEDIDOS")
-
-    return {"status": "success", "order_id": order_id}
 
 # Utils functions
 def fetch_page(input: dict):
@@ -163,6 +158,7 @@ def appsheet_add(data: dict|List[dict], table_name: str = None):
     }
 
     print(f"Sending request: {request}")
+    print(f"sending url {products_url}")
     response = requests.post(products_url, headers=headers, json=request)
     print(f"Response status: {response.status_code}")
     print(f"Response text: {response.text}")
@@ -221,8 +217,237 @@ def appsheet_edit(data: dict|List[dict], table_name: str = None):
         return {"status": "error", "response": response.text}
 
 
+
+def index_all_tables(
+    sql_databases: Dict[str, SQLDatabase] = {"energia_global": sql_database, "energia_global_ventas": sql_database_ventas}, 
+    table_index_dir: str = "./table_indices"
+) -> Dict[str, VectorStoreIndex]:
+    """Index all tables."""
+
+    table_names = [['CLIENTES', 'energia_global_ventas'], ['PRODUCTS', 'energia_global']]
+    # no indexed: CAJA, CHEQUES, PRODUCTOS PEDIDOS, STOCK, CUENTAS CORRIENTES, PEDIDOS, CONTROL DE PRECIOS
+
+    if not Path(table_index_dir).exists():
+        os.makedirs(table_index_dir)
+
+    vector_index_dict = {}
+    
+    for table_info in tqdm(table_names, desc="Indexing tables"):
+        table_name = table_info[0]
+        database_name = table_info[1]
+        sql_database = sql_databases[database_name]
+        engine = sql_database.engine
+        
+        print(f"\nIndexing rows in table: {table_name} from database: {database_name}")
+
+        if not os.path.exists(f"{table_index_dir}/{table_name}"):
+            with engine.connect() as conn:
+                columns_query = (
+                    f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table_name}'"
+                    f"AND TABLE_SCHEMA = '{database_name}' "
+                    f"ORDER BY ORDINAL_POSITION"
+                )
+
+                cursor = conn.execute(text(columns_query))
+                result = cursor.fetchall()
+                original_columns = [column[0] for column in result]
+                # Create sanitized column names for metadata
+                sanitized_columns = [col.replace(' ', '_') for col in original_columns]
+                #print("Column order:", original_columns)  # Debug print
+
+                cursor = conn.execute(text(f'SELECT * FROM `{table_name}`'))
+                row_tups = [tuple(row) for row in cursor.fetchall()]
+                #print("First row values:", row_tups[0])  # Debug print
+
+            nodes = []
+            for t in tqdm(row_tups, desc="Processing rows"):
+                if row_tups.index(t) == 2000:
+                    break
+
+                processed_values = []
+                for value in t:
+                    if isinstance(value, (datetime, Decimal)):
+                        processed_values.append(str(value))
+                    elif value is None:
+                        processed_values.append("")
+                    else:
+                        processed_values.append(str(value))
+
+                nodes.append(TextNode(
+                    text=str(tuple(processed_values)), 
+                    metadata=dict(zip(sanitized_columns, processed_values))
+                ))
+
+            try:
+                index = VectorStoreIndex(nodes)
+            except TypeError as e:
+                print(f"TypeError occurred while creating index: {e}")
+                continue
+            index.set_index_id("vector_index")
+            index.storage_context.persist(f"{table_index_dir}/{table_name}")
+        else:
+            print('index already exists')
+            storage_context = StorageContext.from_defaults(
+                persist_dir=f"{table_index_dir}/{table_name}"
+            )
+            index = load_index_from_storage(
+                storage_context, index_id="vector_index")
+            
+        vector_index_dict[table_name] = index
+
+    return vector_index_dict
+
+def index_from_storage(
+    sql_databases: Dict[str, SQLDatabase] = {"energia_global": sql_database, "energia_global_ventas": sql_database_ventas}, 
+    table_index_dir: str = "./table_indices"
+) -> Dict[str, VectorStoreIndex]:
+    """Index all tables."""
+
+    table_names = [['CLIENTES', 'energia_global_ventas'], ['PRODUCTS', 'energia_global']]
+    # no indexed: CAJA, CHEQUES, PRODUCTOS PEDIDOS, STOCK, CUENTAS CORRIENTES, PEDIDOS, CONTROL DE PRECIOS
+
+    if not Path(table_index_dir).exists():
+        os.makedirs(table_index_dir)
+
+    vector_index_dict = {}
+    
+    for table_info in tqdm(table_names, desc="Indexing tables"):
+        table_name = table_info[0]
+        database_name = table_info[1]
+        sql_database = sql_databases[database_name]
+        engine = sql_database.engine
+        
+        #print(f"\nIndexing rows in table: {table_name} from database: {database_name}")
+        storage_context = StorageContext.from_defaults(
+            persist_dir=f"{table_index_dir}/{table_name}"
+        )
+        index = load_index_from_storage(
+            storage_context, index_id="vector_index")
+            
+        vector_index_dict[table_name] = index
+
+    return vector_index_dict
+
+
+def save_order(data: dict):
+    print(Fore.RED + "[save_order] is being executed" + Style.RESET_ALL)
+
+    if not data.get("ID_CLIENTE"):
+        return {"status": "error", "response": "ID_CLIENTE is required"}
+    if not data.get("OPCIONES"):
+        return {"status": "error", "response": "OPCIONES are required"}
+    
+    try:
+        # Generate IDs
+        order_id = str(uuid.uuid4())[:8].upper()
+        option_ids = [str(uuid.uuid4())[:8].upper() for _ in data["OPCIONES"]]
+
+
+        # 2. Create all options
+        options_data = []
+        for opcion, option_id in zip(data["OPCIONES"], option_ids):
+            options_data.append({
+                "ID_KEY": option_id,
+                "ID_PEDIDO": order_id,
+                "MONEDA": opcion.get("MONEDA"),
+                "DESCUENTO_GENERAL": opcion.get("DESCUENTO_GENERAL", 0)
+            })
+        
+        if options_data:
+            result = appsheet_add(options_data, "OPCIONES_PRESUPUESTOS")
+            if result["status"] != "success":
+                return {"status": "error", "response": result["response"]}
+
+        # 3. Create all products
+        products_data = []
+        for opcion, option_id in zip(data["OPCIONES"], option_ids):
+            for producto in opcion.get("PRODUCTOS_PEDIDOS", []):
+                products_data.append({
+                    "ID OPCION": option_id,
+                    "ID PRODUCTO": producto.get("ID_PRODUCTO"),
+                    "CANTIDAD": producto.get("CANTIDAD"),
+                    "PRECIO LISTA S IVA": producto.get("PRECIO_LISTA_S_IVA")
+                })
+
+        if products_data:
+            result = appsheet_add(products_data, "PRODUCTOS PEDIDOS")
+            if result["status"] != "success":
+                return {"status": "error", "response": result["response"]}
+        
+
+        # 1. Create main order
+        order_data = {
+            "ID_KEY": order_id,
+            "ID_CLIENTE": data.get("ID_CLIENTE"),
+            "VENDEDOR": data.get("VENDEDOR", ""),
+            "TIPO DE ENTREGA": data.get("TIPO_DE_ENTREGA", ""),
+            "DIRECCION": data.get("DIRECCION", ""),
+            "CARGAR COMO PEDIDO": data.get("CARGAR_COMO_PEDIDO", "")
+        }
+        result = appsheet_add(order_data, "PEDIDOS")
+        if result["status"] != "success":
+            return {"status": "error", "response": result["response"]}
+
+        # Mark as saved
+        appsheet_edit({"ID_KEY": order_id, "GUARDADO": 1}, "PEDIDOS")
+
+        return {"status": "success", "order_id": order_id}
+
+    except Exception as e:
+        return {"status": "error", "response": f"Error saving order: {str(e)}"}
+
 if __name__ == "__main__":
 
+    mock_order = {
+    "ID_CLIENTE": "1",
+    "TIPO_DE_ENTREGA": "CLIENTE",
+    "VENDEDOR": "ESTEBAN",
+    "OPCIONES": [
+        {
+            "MONEDA": "PESO",
+            "PRODUCTOS_PEDIDOS": [
+                {
+                    "ID_PRODUCTO": 1001,
+                    "CANTIDAD": 5,
+                },
+                {
+                    "ID_PRODUCTO": 1002,
+                    "CANTIDAD": 3,
+                }
+            ],
+            "DESCUENTO_GENERAL": 10
+        },
+        {
+            "MONEDA": "DOLAR",
+            "PRODUCTOS_PEDIDOS": [
+                {
+                    "ID_PRODUCTO": 1001,
+                    "CANTIDAD": 5
+                }
+            ],
+            "DESCUENTO_GENERAL": 5
+        }
+    ],
+
+    }
+
+    response = save_order(mock_order)
+
+
+
+
+    """ vector_index_dict = index_all_tables({"energia_global": sql_database, "energia_global_ventas": sql_database_ventas})
+
+    test_retriever = vector_index_dict["PRODUCTS"].as_retriever(
+    similarity_top_k=5
+    )
+    nodes = test_retriever.retrieve("EG-GEN-M-10000")
+    for node in nodes:
+        print("Content:", node.get_content())
+        print("Metadata:", node.metadata)
+        print("---") """
+
+    """ 
     test_order = {
         'order_id': 'b8c74e0a', 
         'products': [
@@ -241,7 +466,7 @@ if __name__ == "__main__":
         ]
     }
     response = add_products_to_order_api(test_order)
-    print(response)
+    print(response) """
 
     """ # Test create_order function
     test_create_order = {
