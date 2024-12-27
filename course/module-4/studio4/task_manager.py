@@ -1,41 +1,35 @@
 import operator #operator.add(x, y) is equivalent to the expression x+y
 from pydantic import BaseModel, Field, create_model, model_validator
 from typing import Annotated, List, TypedDict, Literal, Optional, Type, Any
-"""Add context specific metadata to a type.
-Example: Annotated[int, runtime_check.Unsigned] indicates to the
-hypothetical runtime_check module that this type is an unsigned int."""
-
 from typing_extensions import TypedDict # just a dict with types
-
 from langchain_community.document_loaders import WikipediaLoader # for queries on wikipedia
 from langchain_community.tools.tavily_search import TavilySearchResults # for web queries
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, get_buffer_string # message types
 from langchain_openai import ChatOpenAI # to call openai
-
 from langgraph.constants import Send # to call any number of parallel nodes
 from langgraph.graph import END, MessagesState, START, StateGraph # esentials for graphs
 from langgraph.errors import NodeInterrupt
 import json
 import utils.functions as fn
+from utils.procedures import Action, Procedure, ToyStoredProceduresDB
 
 ### LLM
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0) 
 
+### General prompts
+
+general_instructions = f"""Sos un asistente virtual que ayuda a los empleados a usar el software de la empresa.
+Mantené las respuestas claras y profesionales, pero con alta onda. Concentrate en completar tareas específicas de manera eficiente.
+IMPORTANTE: Todos los mensajes tienen que ser en español (Argentino) - usá un lenguaje informal pero profesional común en Argentina, 
+tuteando y usando modismos argentinos apropiados para un ambiente laboral.
+
+"""
+
 ### Schema
 
 class messageClass(BaseModel):
     content:str
-
-class Action(BaseModel):
-    id: int
-    type: str
-    name: str
-    confirmed: bool = True
-    params_schema: Optional[dict] = None
-    params: Optional[dict] = None
-    function: str = ""
-    metadata: Optional[dict] = None
 
 class CanFillResponse(BaseModel):
     can_fill: bool
@@ -49,20 +43,9 @@ class ProcedureCreation(BaseModel):
     message:str
     description:str
 
-class Procedure(BaseModel):
-    description: str = Field(description="What the procedure does")
-    actions: List[Action] = Field(description="Ordered list of actions that the procedure does")
-    #types:List[type] to search procedures by the actions it does (gmail, bank, erp...)
-    @property # we can get all the data in text for a model to use by defining this and using it like: analyst.persona
-    def info(self) -> str:
-        return f"Description: {self.description}\nActions: {self.actions}"
-
 class BestProcedure(BaseModel):
     id: int = Field("the index of the selected procedure in the list of procedures")
     message:str
-
-class ToyStoredProceduresDB(BaseModel):
-    procedures:List[Procedure]
 
 """ class OrchestratorState(TypedDict):
     procedure:Procedure # TODO let the orchestrator edit the retrieved procedure based on human request
@@ -101,7 +84,7 @@ class CreateSelect(BaseModel):
 
 ### Nodes and edges
 
-orchestrator_instructions="""You are tasked to select one of the stored procedures based on the user request. 
+orchestrator_instructions=general_instructions+"""You are tasked to select one of the stored procedures based on the user request. 
 Follow these instructions carefully:
 
 1. First, review the user request and feedback in the conversation.
@@ -173,7 +156,7 @@ def human_feedback_create(state: GeneralState):
 # Executor workflow
 
 # for each analyst: ask questions to drill down and refine your understanding of the topic.
-question_instructions = """You are an executor tasked with execute an specific procedure of actions. 
+question_instructions = general_instructions+"""You are an executor tasked with execute an specific procedure of actions. 
 
 Your goal is boil down to interesting and specific insights related to your topic.
 
@@ -190,6 +173,20 @@ Continue to ask questions to drill down and refine your understanding of the top
 When you are satisfied with your understanding, complete the interview with: "Thank you so much for your help!"
 
 Remember to stay in character throughout your response, reflecting the persona and goals provided to you."""
+
+def filter_required_fields(schema: dict) -> dict:
+    """Remove null-union fields from schema"""
+    filtered_properties = {}
+    for field, props in schema["properties"].items():
+        if not (isinstance(props.get("type"), list) and "null" in props["type"]):
+            filtered_properties[field] = props
+    
+    return {
+        "title": schema["title"],
+        "type": "object",
+        "properties": filtered_properties,
+        "required": [f for f in filtered_properties.keys()]
+    }
 
 # here we are already using the state for the executor, completely uncoupled from the other states.
 # here the executor executes the selected procedure
@@ -215,8 +212,11 @@ def executor(state: GeneralState):
     
     for action in actions:
 
-        # If the action has no params, we need to fill them
-        if not action.params:
+        # If the action has no params but has a params schema, we need to fill them
+        if not action.params and action.params_schema:
+
+            # Filter schema to only required fields
+            required_schema = filter_required_fields(action.params_schema)
 
             # First request: Can we fill the params?
             decision_llm = llm.with_structured_output(
@@ -226,15 +226,24 @@ def executor(state: GeneralState):
             )
             
             can_fill = decision_llm.invoke([
-                SystemMessage(content=f"""
-                Based on the conversation context, can you fill these parameters?
-                Schema: {action.params_schema}
+                SystemMessage(content=general_instructions+f"""
+            Analyze if we can fill these parameters based on information provided in the conversation.
 
-                Remember that the user has to provide the values for the parameters and you don't have to guess them.
-                
-                If yes, explain what values you'll use in one sentence.
-                If no, send a message to the user explaining what information is missing.
-                """)
+            RULES FOR REQUIRED FIELDS:
+            1. Only use data explicitly provided in the conversation
+            2. Required fields must have actual values from conversation
+            3. List any missing fields when asking user
+
+            Response format:
+            - If all parameters can be filled:
+              can_fill: true
+              message: List the exact values you'll use
+            - If any parameter is missing:
+              can_fill: false
+              message: List the missing required fields in a conversational way in one sentence.
+
+            Schema: {required_schema}
+            """)
             ] + messages)
 
             # If we can fill the params, we need to fill them
@@ -247,13 +256,14 @@ def executor(state: GeneralState):
                 )
                 
                 filled_params = params_llm.invoke([
-                    SystemMessage(content="Fill the parameters based on the conversation context")
+                    SystemMessage(content=general_instructions+"Fill the parameters based on the conversation context")
                 ] + messages)
                 
                 action.params = filled_params
                 data.update(filled_params)
                 # Also pass the action metadata to the data
-                data.update(action.metadata)
+                if action.metadata:
+                    data.update(action.metadata)
 
             # If we can't fill the params, we need to ask the user  
             else:
@@ -268,9 +278,7 @@ def executor(state: GeneralState):
                         }
 
         # Once we have the params, check action confirmation and execute
-
         confirmed = action.confirmed
-
         if human_feedback_action_message.lower() == 'yes':
             messages.append(HumanMessage(content="I confirm the action"))
             confirmed = True
@@ -285,54 +293,47 @@ def executor(state: GeneralState):
                     "data": data
                     }
 
-
-
         if confirmed:
             # There is a function to execute
             if action.function and action.function != "":
                 try:
-                    # Print debug info
-                    print(f"Data being passed to function: {data}")
-                    
                     # Execute the function
                     result = getattr(fn, action.function)(data)
-                    
                     # Ensure result is valid JSON
                     if not isinstance(result, dict):
                         raise ValueError("Function must return a dictionary")
-                        
                     data.update(result)
                     
                     if result.get("status") != "error":
-                        messages.append(AIMessage(content=f"The action {action.name} was executed successfully"))
+                        message = AIMessage(content=f"The action {action.name} was executed successfully")
+                        message.name = 'log'
+                        messages.append(message)
+                        #llm_str = llm.with_structured_output(messageClass)
+                        #response = llm_str.invoke([SystemMessage(content=general_instructions+f"Send a one sentence message to the user to inform that the {action.name} was executed successfully")])
+                        #messages.append(AIMessage(content=response.content))
                         done_actions.append(action)
                         actions = actions[1:]
                     else:
-                        messages.append(AIMessage(content=f"Error executing action {action.name}: {result.get('response')}"))
+                        message = AIMessage(content=f"Error executing action {action.name}: {result.get('response')}, data sent: {data}")
+                        message.name = 'log'
+                        messages.append(message)
+                        llm_str = llm.with_structured_output(messageClass)
+                        response = llm_str.invoke([SystemMessage(content=general_instructions+"Send a one sentence message to the user to inform about the error and suggest to try again")])
+                        messages.append(AIMessage(content=response.content))
+                        return {
+                        "messages": messages,
+                        "human_feedback_action_message": "",
+                        "human_feedback_select_message": "",
+                        "done_actions": done_actions, 
+                        "pending_actions": actions,
+                        "data": data
+                    }
                         
-                except json.JSONDecodeError as e:
-                    messages.append(AIMessage(content=f"Error parsing JSON response: {str(e)}, data sent: {data}"))
-                    return {
-                        "messages": messages,
-                        "human_feedback_action_message": "",
-                        "human_feedback_select_message": "",
-                        "done_actions": done_actions, 
-                        "pending_actions": actions,
-                        "data": data
-                    }
-
-                except AttributeError as e:
-                    messages.append(AIMessage(content=f"Error executing function {action.function}: {str(e)}"))
-                    return {
-                        "messages": messages,
-                        "human_feedback_action_message": "",
-                        "human_feedback_select_message": "",
-                        "done_actions": done_actions, 
-                        "pending_actions": actions,
-                        "data": data
-                    }
                 except Exception as e:
-                    messages.append(AIMessage(content=f"Error during execution: {str(e)}"))
+                    messages.append(AIMessage(content=f"Error during execution: {str(e)}", name="log"))
+                    llm_str = llm.with_structured_output(messageClass)
+                    response = llm_str.invoke([SystemMessage(content=general_instructions+"Send a one sentence message to the user to inform about the error and suggest to try again")])
+                    messages.append(AIMessage(content=response.content))
                     return {
                         "messages": messages,
                         "human_feedback_action_message": "",
@@ -342,12 +343,22 @@ def executor(state: GeneralState):
                         "data": data
                     }
             
-                
-
-            
+            # There is no function to execute
+            else:
+                message = AIMessage(content=f"The action {action.name} was executed successfully")
+                message.name = 'log'
+                messages.append(message)
+                done_actions.append(action)
+                actions = actions[1:]
+    
         # If the action is not confirmed, we need to ask the user
         else:
-            messages.append(AIMessage(content=f"The action {action.name} needs your confirmation"))
+            message = AIMessage(content=f"The action '{action.name}' needs your confirmation")
+            message.name = 'log'
+            messages.append(message)
+            llm_str = llm.with_structured_output(messageClass)
+            response = llm_str.invoke([SystemMessage(content=general_instructions+"Send a one sentence message to the user to ask for confirmation of the action")])
+            messages.append(AIMessage(content=response.content))
             return {
                     "messages": messages,
                     "human_feedback_action_message": "",
@@ -368,7 +379,7 @@ def executor(state: GeneralState):
                         }
 
 # prompt for the procedure creator
-creator_instructions="""You are tasked to create an ordered list of actions (called stored procedure) based on the user request, 
+creator_instructions=general_instructions+"""You are tasked to create an ordered list of actions (called stored procedure) based on the user request, 
 and with the actions database you are provided. 
 
 Follow these instructions carefully:
@@ -435,7 +446,7 @@ def start(state: GeneralState):
     if actions_database != {} or stored_procedures != {}:
         llm_str = llm.with_structured_output(messageClass)
         
-        response = llm_str.invoke([SystemMessage(content="Send a one sentence message to the user to conclude the last conversation and tell that you are available to do another task")]+messages)
+        response = llm_str.invoke([SystemMessage(content=general_instructions+"Send a one sentence message to the user to conclude the last conversation and tell that you are available to do another task")]+messages)
         messages.append(AIMessage(content=response.content))
         return {"messages": messages}
 
@@ -523,88 +534,180 @@ def start(state: GeneralState):
             ]
         ),
         Procedure(
-        description="create new order in system",
+        description="TEST TEST TEST TEST. ONLY USE IF SPECIFIED A TEST BY THE USER. create new order in system",
         actions=[
             Action(
-    id=13, 
-    name="send the main order info to the system",
-    type="erp",
-    confirmed=True,
-    params_schema={
-        "title": "Order",
-        "type": "object",
-        "properties": {
-            "ID_CLIENTE": {
-                "type": "string",
-                "description": "Client ID"
-            },
-            "TIPO_DE_ENTREGA": {
-                "type": "string",
-                "enum": ["CLIENTE", "RETIRA EN FÁBRICA", "OTRO"],
-                "description": "Delivery type"
-            },
-            "METODO_DE_PAGO": {
-                "type": "string",
-                "enum": ["EFECTIVO", "DÓLARES", "MERCADO PAGO", "CHEQUE", "TRANSFERENCIA BANCARIA"],
-                "description": "Payment method"
-            },
-            "DIRECCION": {
-                "type": "string",
-                "description": "Delivery address (leave empty string ('') if not needed if the delivery type is 'RETIRA EN FÁBRICA' or 'CLIENTE')"
-            },
-            "NOTA": {
-                "type": "string",
-                "description": "Note (leave empty string ('') if not needed)"
-            }
-        },
-        "required": ["ID_CLIENTE", "TIPO_DE_ENTREGA", "METODO_DE_PAGO", "DIRECCION", "NOTA"]
-    },
-    metadata={"table_name": "PEDIDOS"},
-    function="appsheet_add"
-        ),
-Action(
-            id=14,
-            name="add products to the order",
-            type="erp",
-            confirmed=True,
-            params_schema={
-                "title": "OrderProducts",
-                "type": "object",
-                "properties": {
-                    "products": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "ID_PRODUCTO": {
-                                    "type": "integer",
-                                    "title": "Product ID found in the database",
-                                    "strict": True
-                                },
-                                "TIPO": {
-                                    "type": "string",
-                                    "enum": ["ESTANDAR", "INTENSO", "PIEDRA GRANITO"],
-                                    "title": "Type of the color, each color has a corresponding type in the database"
-                                },
-                                "COLOR": {
-                                    "type": "string",
-                                    "title": "Color of the product (TYPE GOES IN THE OTHER FIELD), in the database it is a foreign key",
-                                    "strict": True
-                                },
-                                "CANTIDAD": {
-                                    "type": "integer",
-                                    "title": "Quantity",
-                                    "strict": True
-                                }
-                            },
-                            "required": ["ID_PRODUCTO", "TIPO", "COLOR", "CANTIDAD"]
+                id=13, 
+                name="send the main order info to the system",
+                type="erp",
+                confirmed=True,
+                params_schema={
+                    "title": "Order",
+                    "type": "object",
+                    "properties": {
+                        "ID_CLIENTE": {
+                            "type": "string",
+                            "description": "Client ID"
+                        },
+                        "TIPO_DE_ENTREGA": {
+                            "type": "string",
+                            "enum": ["CLIENTE", "RETIRA EN FÁBRICA", "OTRO"],
+                            "description": "Delivery type"
+                        },
+                        "METODO_DE_PAGO": {
+                            "type": "string",
+                            "enum": ["EFECTIVO", "DÓLARES", "MERCADO PAGO", "CHEQUE", "TRANSFERENCIA BANCARIA"],
+                            "description": "Payment method"
+                        },
+                        "DIRECCION": {
+                            "type": ["string", "null"],
+                            "description": "Optional delivery address. Leave empty if not needed.",
+                        },
+                        "NOTA": {
+                            "type": ["string", "null"],
+                            "description": "Optional note. Leave empty if not needed.",
                         }
                     },
-                },
-                "required": ["products"]
+                    "required": ["ID_CLIENTE", "TIPO_DE_ENTREGA", "METODO_DE_PAGO", "DIRECCION", "NOTA"]
                 },
                 metadata={"table_name": "PEDIDOS"},
-                function="appsheet_add",)
+                function="create_order",
+                ),
+            Action(
+                id=14,
+                name="add products to the order",
+                type="erp",
+                confirmed=True,
+                params_schema={
+                    "title": "OrderProducts",
+                    "type": "object",
+                    "properties": {
+                        "products": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "ID_PRODUCTO": {
+                                        "type": "integer",
+                                        "title": "Product ID found in the database",
+                                    },
+                                    "TIPO": {
+                                        "type": "string",
+                                        "enum": ["ESTANDAR", "INTENSO", "PIEDRA GRANITO"],
+                                        "title": "Type of the color, each color has a corresponding type in the database"
+                                    },
+                                    "COLOR": {
+                                        "type": "string",
+                                        "title": "Color of the product (TYPE GOES IN THE OTHER FIELD), in the database it is a foreign key",
+                                    },
+                                    "CANTIDAD": {
+                                        "type": "integer",
+                                        "title": "Quantity"
+                                    }
+                                },
+                                "required": ["ID_PRODUCTO", "TIPO", "COLOR", "CANTIDAD"]
+                            }
+                        },
+                    },
+                    "required": ["products"]
+                    },
+                    #metadata={"table_name": "PRODUCTOS_PEDIDOS"},
+                    function="add_products_to_order",),
+            Action(
+                    id=15,
+                    name="save order",
+                    type="erp",
+                    confirmed=False,
+                    function="save_order"
+                )
+                ]),
+        Procedure(
+                description="PRODUCTION READY. Create new order in system",
+                actions=[
+            Action(
+                id=13, 
+                name="send the main order info to the system",
+                type="erp",
+                confirmed=True,
+                params_schema={
+                    "title": "Order",
+                    "type": "object",
+                    "properties": {
+                        "ID_CLIENTE": {
+                            "type": "string",
+                            "description": "Client ID"
+                        },
+                        "TIPO_DE_ENTREGA": {
+                            "type": "string",
+                            "enum": ["CLIENTE", "RETIRA EN FÁBRICA", "OTRO"],
+                            "description": "Delivery type"
+                        },
+                        "METODO_DE_PAGO": {
+                            "type": "string",
+                            "enum": ["EFECTIVO", "DÓLARES", "MERCADO PAGO", "CHEQUE", "TRANSFERENCIA BANCARIA"],
+                            "description": "Payment method"
+                        },
+                        "DIRECCION": {
+                            "type": ["string", "null"],
+                            "description": "Optional delivery address. Leave empty if not needed.",
+                        },
+                        "NOTA": {
+                            "type": ["string", "null"],
+                            "description": "Optional note. Leave empty if not needed.",
+                        }
+                    },
+                    "required": ["ID_CLIENTE", "TIPO_DE_ENTREGA", "METODO_DE_PAGO", "DIRECCION", "NOTA"]
+                },
+                metadata={"table_name": "PEDIDOS"},
+                function="create_order",
+                ),
+            Action(
+                id=14,
+                name="add products to the order",
+                type="erp",
+                confirmed=True,
+                params_schema={
+                    "title": "OrderProducts",
+                    "type": "object",
+                    "properties": {
+                        "products": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "ID_PRODUCTO": {
+                                        "type": "integer",
+                                        "title": "Product ID found in the database",
+                                    },
+                                    "TIPO": {
+                                        "type": "string",
+                                        "enum": ["ESTANDAR", "INTENSO", "PIEDRA GRANITO"],
+                                        "title": "Type of the color, each color has a corresponding type in the database"
+                                    },
+                                    "COLOR": {
+                                        "type": "string",
+                                        "title": "Color of the product (TYPE GOES IN THE OTHER FIELD), in the database it is a foreign key",
+                                    },
+                                    "CANTIDAD": {
+                                        "type": "integer",
+                                        "title": "Quantity"
+                                    }
+                                },
+                                "required": ["ID_PRODUCTO", "TIPO", "COLOR", "CANTIDAD"]
+                            }
+                        },
+                    },
+                    "required": ["products"]
+                    },
+                    #metadata={"table_name": "PRODUCTOS_PEDIDOS"},
+                    function="add_products_to_order",),
+            Action(
+                    id=15,
+                    name="save order",
+                    type="erp",
+                    confirmed=False,
+                    function="save_order"
+                )
                 ])
         ]),
         "human_feedback_select_message": "approve"
@@ -675,7 +778,7 @@ def decide_create_done(state: GeneralState):
 
 # prompt to select wether to create a new procedure or select one
 # TODO give more context of the situation for the llm in the prompt
-# TODO actually look at the procedures to figure out if we need to create a new one, or we can use a stored one
+# actually look at the procedures to figure out if we need to create a new one, or we can use a stored one
 decide_create_select_instructions="""You are tasked to select one between two options: 
 create a new procedure or select one of the stored procedures based on the user request. 
 Based on the users request, return the corresponding procedure to use.
@@ -716,7 +819,7 @@ def decide_create_select(state: GeneralState):
     system_message = decide_create_select_instructions#.format(request=request)
 
     # select create or select
-    selection = structured_llm.invoke([SystemMessage(content=system_message)]+[HumanMessage(content=request)])
+    selection = structured_llm.invoke([SystemMessage(content=general_instructions+system_message)]+[HumanMessage(content=request)])
 
     if selection.selection == "create_procedure":
         return Send("create_procedure", {
@@ -728,7 +831,6 @@ def decide_create_select(state: GeneralState):
         })
     else:
         return selection.selection
-
 
 # Add nodes and edges 
 builder = StateGraph(GeneralState) #initialization of the orchestrator graph
