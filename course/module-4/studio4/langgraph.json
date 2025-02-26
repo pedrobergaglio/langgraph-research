@@ -2,7 +2,9 @@
   "dockerfile_lines": [],
   "graphs": {
     "task_manager": "./task_manager.py:graph",
-    "research_assistant_bis": "./research_assistant_bis.py:graph"
+    "research_assistant_bis": "./research_assistant_bis.py:graph",
+    "designer_agent": "./designer_agent.py:graph"
+
   },
   "env": "./.env",
   "python_version": "3.11",
