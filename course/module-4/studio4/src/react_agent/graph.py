@@ -98,7 +98,7 @@ def route_model_output(state: State) -> Literal["__end__", "tools"]:
     # If there is no tool call, then we finish
     if not last_message.tool_calls:
         return "__end__"
-    ***REMOVED***wise we execute the requested actions
+    # Otherwise we execute the requested actions
     return "tools"
 
 

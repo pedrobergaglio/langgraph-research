@@ -385,7 +385,7 @@ def decide_execute_orchestrator(state: GeneralState):
         # Return to create_analysts
         return "select_procedure"
 
-    ***REMOVED***wise 
+    # Otherwise 
     else:
         return "executor"
 
@@ -402,7 +402,7 @@ def decide_execute_end(state: GeneralState):
         return "start" # if user cancels OR all tasks are done just finish the execution
     elif human_feedback_confirm_message != '':
         return "executor"
-    ***REMOVED***wise 
+    # Otherwise 
     else:
         raise NodeInterrupt("There are still actions pending")
         #return "executor"
